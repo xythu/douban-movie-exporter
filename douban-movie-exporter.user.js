@@ -2,8 +2,8 @@
 // @name         豆瓣书影音游戏数据导出工具
 // @name:en      Douban Media Export Tool
 // @name:zh-CN   豆瓣书影音游戏数据导出工具
-// @namespace    https://github.com/byJming/douban-movie-exporter
-// @version      2.4.0
+// @namespace    https://github.com/xythu/douban-movie-exporter
+// @version      2.4.1
 // @description  导出豆瓣电影、读书、音乐和游戏收藏，支持 Excel/JSON、封面资源 ZIP，并在豆瓣页面提供汇总导航。
 // @description:en Export Douban movies, books, music and games to Excel/JSON with cover ZIP support and a compact summary navigator.
 // @author       ming
@@ -38,8 +38,10 @@
 // @connect      img8.doubanio.com
 // @connect      img9.doubanio.com
 // @license      MIT
-// @homepage     https://github.com/byJming/douban-movie-exporter
-// @supportURL   https://github.com/byJming/douban-movie-exporter/issues
+// @homepage     https://github.com/xythu/douban-movie-exporter
+// @supportURL   https://github.com/xythu/douban-movie-exporter/issues
+// @updateURL    https://raw.githubusercontent.com/xythu/douban-movie-exporter/main/douban-movie-exporter.user.js
+// @downloadURL  https://raw.githubusercontent.com/xythu/douban-movie-exporter/main/douban-movie-exporter.user.js
 // ==/UserScript==
 
 (function () {
@@ -152,6 +154,9 @@
     function getProfileSlug() {
         const match = location.pathname.match(/^\/people\/([^/]+)/);
         if (match) return match[1];
+        const pageLink = document.querySelector('.paginator a[href*="/people/"]');
+        const pageMatch = pageLink && pageLink.href.match(/\/people\/([^/?#]+)/);
+        if (pageMatch) return pageMatch[1];
         const userId = window._GLOBAL_NAV && window._GLOBAL_NAV.USER_ID;
         if (userId) return String(userId);
         const profileLink = [...document.querySelectorAll('a[href]')].find(link => {
@@ -176,29 +181,33 @@
     }
 
     function storageKey(key) {
-        // /mine 首页的下一页通常会跳到 /people/<id>/collect，按 host 存储可跨分页保持状态。
+        // 会话存储隔离标签页，并在同源分页跳转后保留任务。
         return `${key}:${location.hostname}`;
     }
 
     function getState() {
-        return parseJson(localStorage.getItem(storageKey(CONFIG.stateKey)), { status: 'idle' });
+        return parseJson(sessionStorage.getItem(storageKey(CONFIG.stateKey)), { status: 'idle' });
     }
 
     function setState(state) {
-        localStorage.setItem(storageKey(CONFIG.stateKey), JSON.stringify(state));
+        sessionStorage.setItem(storageKey(CONFIG.stateKey), JSON.stringify(state));
     }
 
     function getStoredData() {
-        return parseJson(localStorage.getItem(storageKey(CONFIG.dataKey)), []);
+        return parseJson(sessionStorage.getItem(storageKey(CONFIG.dataKey)), []);
     }
 
     function setStoredData(data) {
-        localStorage.setItem(storageKey(CONFIG.dataKey), JSON.stringify(data));
+        // ID、链接和分类用于去重与封面关联，其余仅暂存用户选中的字段。
+        const fields = new Set([...getSelectedFields(), 'id', 'link', 'category']);
+        if (getState().includeCovers) fields.add('cover_url');
+        const selected = data.map(item => Object.fromEntries(Object.entries(item).filter(([key]) => fields.has(key))));
+        sessionStorage.setItem(storageKey(CONFIG.dataKey), JSON.stringify(selected));
     }
 
     function getSelectedFields() {
         const allowed = new Set(FIELDS.map(field => field.key));
-        return parseJson(localStorage.getItem(storageKey(CONFIG.fieldsKey)), FIELDS.filter(f => f.default).map(f => f.key))
+        return parseJson(sessionStorage.getItem(storageKey(CONFIG.fieldsKey)), FIELDS.filter(f => f.default).map(f => f.key))
             .filter(field => allowed.has(field));
     }
 
@@ -240,12 +249,28 @@
         return match ? match[1] : '';
     }
 
-    function getStatusFromUrl() {
-        const url = new URL(location.href);
+    function getStatusFromUrl(href = location.href) {
+        const url = new URL(href);
         const param = url.searchParams.get('status') || url.searchParams.get('action');
         if (param) return param;
         const match = url.pathname.match(/\/(collect|wish|do)\/?$/);
         return match ? match[1] : 'collect';
+    }
+
+    function getCollectionScope(category, href = location.href) {
+        const url = new URL(href);
+        const match = url.pathname.match(/^\/people\/([^/]+)\/(collect|wish|do|games)\/?$/);
+        const profile = match ? match[1] : /^\/mine\/?$/.test(url.pathname) ? getProfileSlug() : '';
+        return profile ? `${url.origin}:${category}:${profile}:${getStatusFromUrl(href)}` : '';
+    }
+
+    function isTaskPage(state, category) {
+        return state.category === category && Boolean(state.scope) && state.scope === getCollectionScope(category);
+    }
+
+    function isRunningTask(state, category) {
+        const current = getState();
+        return current.status === 'running' && current.taskId === state.taskId && isTaskPage(current, category);
     }
 
     function baseRecord(category, link, item) {
@@ -256,7 +281,7 @@
             rating: '',
             date: '',
             status: getStatusFromUrl(),
-            tags: '',
+            tags: textOf(item.querySelector('.tags')).replace(/^标签[:：]\s*/, ''),
             comment: '',
             intro: '',
             cover_url: getCover(item, category),
@@ -273,7 +298,6 @@
             record.title = cleanTitle(textOf(titleLink));
             record.rating = getRating(item);
             record.date = extractDate(textOf(item.querySelector('.date')));
-            record.tags = textOf(item.querySelector('.tags')).replace(/^标签[:：]\s*/, '');
             record.comment = textOf(item.querySelector('.comment'));
             record.intro = textOf(item.querySelector('.intro'));
             return record;
@@ -334,7 +358,7 @@
             const listUrl = new URL(location.href);
             listUrl.searchParams.set('mode', 'list');
             const response = await fetch(listUrl.href, { credentials: 'include' });
-            if (!response.ok) return records;
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
             const html = await response.text();
             const doc = new DOMParser().parseFromString(html, 'text/html');
             const detailMap = new Map();
@@ -346,9 +370,10 @@
                     comment: textOf(item.querySelector('.comment'))
                 });
             });
-            records.forEach(record => Object.assign(record, detailMap.get(record.id) || {}));
+            if (records.some(record => !detailMap.has(record.id))) throw new Error('列表页缺少当前页条目');
+            records.forEach(record => Object.assign(record, detailMap.get(record.id)));
         } catch (e) {
-            console.warn('[Douban Export] 无法补充电影列表字段:', e);
+            throw new Error(`无法补充电影标签/短评：${e.message || e}`);
         }
         return records;
     }
@@ -382,6 +407,11 @@
         return pages.length ? Math.max(...pages) : 1;
     }
 
+    function getTotalRecordCount() {
+        const match = textOf(document.querySelector('.subject-num')).match(/\/\s*(\d+)\s*$/);
+        return match ? Number(match[1]) : null;
+    }
+
     function formatPageRange(pageRange) {
         return pageRange ? `第 ${pageRange.startPage}～${pageRange.endPage} 页` : '全部页（从第 1 页开始）';
     }
@@ -399,9 +429,9 @@
         return slug ? `https://www.douban.com/people/${slug}/games?action=collect` : '';
     }
 
-    function getCategoryStatusLabel(category) {
+    function getCategoryStatusLabel(category, status = getStatusFromUrl()) {
         const labels = STATUS_LABELS[category] || STATUS_LABELS.movie;
-        return labels[getStatusFromUrl()] || labels.collect;
+        return labels[status] || labels.collect;
     }
 
     function getCategoryStatusUrl(category, slug, status) {
@@ -447,7 +477,7 @@
 
     function getCategoryStatusFilePart() {
         const parts = { collect: 'Collect', wish: 'Wish', do: 'Do' };
-        return parts[getStatusFromUrl()] || 'Collect';
+        return parts[getState().collectionStatus || getStatusFromUrl()] || 'Collect';
     }
 
     function withAutoExport(url) {
@@ -728,6 +758,7 @@
     }
 
     async function downloadCoversZip(category, statusEl, button) {
+        const exportState = getState();
         const records = getStoredData()
             .map((item, dataIndex) => ({ item, dataIndex }))
             .filter(entry => entry.item.cover_url);
@@ -771,13 +802,14 @@
             }
         };
         await Promise.all(Array.from({ length: Math.min(CONFIG.coverConcurrency, records.length) }, worker));
+        if (getState().taskId !== exportState.taskId) throw new Error('导出任务已变化，请在当前任务中重新下载');
         const failures = manifest.filter(item => !item.downloaded);
         if (statusEl) statusEl.textContent = `封面下载完成：成功 ${records.length - failures.length}，失败 ${failures.length}；正在准备资源包中的 JSON 和 Excel…`;
         const packageEntries = buildDataPackageEntries(category);
         fileEntries.push(...packageEntries);
-        const exportState = getState();
         const manifestText = JSON.stringify({
             category,
+            complete: exportState.status === 'paused_for_download',
             total: records.length,
             downloaded: records.length - failures.length,
             failed: failures.length,
@@ -802,8 +834,8 @@
         } finally {
             clearInterval(progressTimer);
         }
-        const statusPart = getCategoryStatusFilePart();
-        triggerDownload(blob, `Douban_${CATEGORIES[category].file}${statusPart ? `_${statusPart}` : ''}_Covers_${new Date().toISOString().slice(0, 10)}.zip`);
+        if (getState().taskId !== exportState.taskId) throw new Error('导出任务已变化，请在当前任务中重新下载');
+        triggerDownload(blob, `${getExportBaseName(category).replace('_Export', '_Covers')}.zip`);
         if (statusEl) statusEl.textContent = `封面 ZIP 已生成：${formatBytes(blob.size)}；成功 ${records.length - failures.length}，失败 ${failures.length}`;
         if (button) { button.disabled = false; button.textContent = '🖼️ 重新下载封面 ZIP'; }
     }
@@ -851,7 +883,6 @@
                 }
                 pageRange = { startPage, endPage };
             }
-            localStorage.setItem(storageKey(CONFIG.fieldsKey), JSON.stringify(fields));
             overlay.remove();
             startScraping(category, fields, exportCovers, pageRange);
         };
@@ -861,6 +892,7 @@
         if (document.getElementById('db-export-modal-overlay')) return;
         const data = getStoredData();
         const state = getState();
+        const complete = state.status === 'paused_for_download';
         const includeCovers = Boolean(state.includeCovers);
         const coverCount = data.filter(item => item.cover_url).length;
         const coverAction = includeCovers && coverCount > 0 ? `<button class="db-btn db-btn-primary" style="background:#7b61ff" id="db-dl-covers">📦 下载完整资源包 ZIP（封面 + JSON + Excel）</button>` : '';
@@ -872,7 +904,8 @@
         const overlay = document.createElement('div');
         overlay.id = 'db-export-modal-overlay';
         overlay.innerHTML = `<div id="db-export-modal">
-            <h3>✅ 抓取完成</h3><p style="font-size:16px;text-align:center">共收集到 <b>${data.length}</b> 条${CATEGORIES[category].label}数据（${formatPageRange(state.pageRange)}）</p>
+            <h3>${complete ? '✅ 抓取完成' : '⚠️ 抓取未完成'}</h3><p style="font-size:16px;text-align:center">共收集到 <b>${data.length}</b> 条${CATEGORIES[category].label}数据（${formatPageRange(state.pageRange)}）</p>
+            ${complete ? '' : `<p class="db-note">${escapeHtml(state.message)}。下方只能下载已收集的部分数据，文件名含 Partial 标记。</p><button class="db-btn db-btn-primary" id="db-retry-page">重试本页</button>`}
             <p class="db-note">${coverNote}</p>
             <div class="db-download-section"><div class="db-download-title">单独导出数据文件</div><div class="db-download-actions"><button class="db-btn db-btn-primary" id="db-dl-xlsx">📊 单独导出 Excel (.xlsx)</button><button class="db-btn db-btn-primary" style="background:#2c3e50" id="db-dl-json">🤖 单独导出 JSON</button></div></div>
             ${includeCovers && coverCount > 0 ? `<div class="db-download-section"><div class="db-download-title">完整资源包</div><div class="db-download-actions">${coverAction}</div><p class="db-note">ZIP 内含 covers/、data/*.json、data/*.xlsx 和 cover-manifest.json。</p></div>` : ''}
@@ -881,6 +914,12 @@
         document.body.appendChild(overlay);
         overlay.querySelector('#db-dl-xlsx').onclick = () => generateFile(category, 'xlsx');
         overlay.querySelector('#db-dl-json').onclick = () => generateFile(category, 'json');
+        const retryButton = overlay.querySelector('#db-retry-page');
+        if (retryButton) retryButton.onclick = () => {
+            overlay.remove();
+            setState({ ...state, status: 'running' });
+            processPage(category, getSelectedFields());
+        };
         const coverButton = overlay.querySelector('#db-dl-covers');
         if (coverButton) coverButton.onclick = () => downloadCoversZip(category, overlay.querySelector('#db-cover-status'), coverButton).catch(error => {
             const status = overlay.querySelector('#db-cover-status');
@@ -889,7 +928,7 @@
             coverButton.textContent = '🖼️ 重试下载封面 ZIP';
         });
         overlay.querySelector('#db-close-finish').onclick = () => {
-            localStorage.removeItem(storageKey(CONFIG.dataKey));
+            sessionStorage.removeItem(storageKey(CONFIG.dataKey));
             setState({ status: 'idle' });
             location.reload();
         };
@@ -912,7 +951,15 @@
     function startScraping(category, fields, includeCovers, pageRange) {
         const current = new URL(location.href);
         const target = getPageStartUrl(category, pageRange ? pageRange.startPage : 1);
-        setState({ status: 'running', category, includeCovers: Boolean(includeCovers), pageRange: pageRange || null, startedAt: new Date().toISOString() });
+        const scope = getCollectionScope(category);
+        if (!scope) { alert('无法识别收藏所属用户，请从个人收藏页重新开始。'); return; }
+        sessionStorage.setItem(storageKey(CONFIG.fieldsKey), JSON.stringify(fields));
+        setState({
+            status: 'running', category, scope, collectionStatus: getStatusFromUrl(), taskId: crypto.randomUUID(),
+            includeCovers: Boolean(includeCovers), pageRange: pageRange || null,
+            nextPage: pageRange ? pageRange.startPage : 1, endPage: pageRange ? pageRange.endPage : getTotalPageCount(),
+            totalPages: getTotalPageCount(), totalRecords: getTotalRecordCount(), startedAt: new Date().toISOString()
+        });
         setStoredData([]);
         if (target !== current.href) {
             location.href = target;
@@ -923,27 +970,42 @@
 
     async function processPage(category, fields) {
         const state = getState();
-        if (state.status !== 'running') return;
+        if (!isRunningTask(state, category)) return;
         const delay = Math.floor(Math.random() * (CONFIG.maxDelay - CONFIG.minDelay) + CONFIG.minDelay);
         setTimeout(async () => {
+            if (!isRunningTask(state, category)) return;
             try {
                 const pageData = await scrapeCurrentPage(category, fields);
-                if (!state.includeCovers) pageData.forEach(item => { item.cover_url = ''; });
-                const merged = new Map(getStoredData().map(item => [item.link || item.id, item]));
-                pageData.forEach(item => merged.set(item.link || item.id, item));
-                setStoredData([...merged.values()]);
+                if (!isRunningTask(state, category)) return;
                 const currentPage = getCurrentPageNumber(category);
-                const reachedRangeEnd = state.pageRange && currentPage >= state.pageRange.endPage;
-                const next = reachedRangeEnd ? '' : getNextPage();
-                if (next) location.href = next;
+                const pageSize = CATEGORIES[category].pageSize;
+                if (currentPage !== state.nextPage || getTotalPageCount() !== state.totalPages) throw new Error('页码或总页数发生变化，请重新开始导出');
+                if (state.totalRecords !== null && Math.max(1, Math.ceil(state.totalRecords / pageSize)) !== state.totalPages) throw new Error('总条目数与分页不一致，无法确认导出完整性');
+                const expected = state.totalRecords !== null
+                    ? Math.min(pageSize, state.totalRecords - (currentPage - 1) * pageSize)
+                    : currentPage < state.totalPages ? pageSize : null;
+                if (!pageData.length || pageData.length > pageSize || (expected !== null && pageData.length !== expected)) throw new Error('本页条目数量异常，可能需要登录、完成验证或更新页面解析规则');
+                if (pageData.some(item => !item.id || !item.title)) throw new Error('本页条目缺少 ID 或标题');
+                const next = currentPage < state.endPage ? getNextPage() : '';
+                if (currentPage < state.endPage && (!next || getCollectionScope(category, next) !== state.scope || Number(new URL(next).searchParams.get('start')) !== currentPage * pageSize)) throw new Error('下一页链接缺失或异常，导出未完成');
+                const merged = new Map(getStoredData().map(item => [item.id, item]));
+                const previousCount = merged.size;
+                pageData.forEach(item => merged.set(item.id, item));
+                if (merged.size !== previousCount + pageData.length) throw new Error('分页中出现重复条目，导出未完成');
+                setStoredData([...merged.values()]);
+                if (next) {
+                    setState({ ...state, nextPage: currentPage + 1 });
+                    location.href = next;
+                }
                 else {
-                    setState({ status: 'paused_for_download', category, includeCovers: Boolean(state.includeCovers), pageRange: state.pageRange || null, startedAt: state.startedAt, finishedAt: new Date().toISOString() });
+                    setState({ ...state, status: 'paused_for_download', finishedAt: new Date().toISOString() });
                     showDownloadPanel(category);
                 }
             } catch (error) {
+                if (!isRunningTask(state, category)) return;
                 console.error('[Douban Export] 页面解析失败:', error);
-                setState({ status: 'error', category, includeCovers: Boolean(state.includeCovers), pageRange: state.pageRange || null, message: String(error) });
-                alert('本页解析失败，请打开控制台查看错误后重试。');
+                setState({ ...state, status: 'error', message: String(error) });
+                showDownloadPanel(category);
             }
         }, delay);
     }
@@ -965,7 +1027,8 @@
 
     function getExportBaseName(category) {
         const statusPart = getCategoryStatusFilePart();
-        return `Douban_${CATEGORIES[category].file}${statusPart ? `_${statusPart}` : ''}_Export_${new Date().toISOString().slice(0, 10)}`;
+        const partial = getState().status === 'paused_for_download' ? '' : '_Partial';
+        return `Douban_${CATEGORIES[category].file}${statusPart ? `_${statusPart}` : ''}_Export${partial}_${new Date().toISOString().slice(0, 10)}`;
     }
 
     function buildJsonOutput(category) {
@@ -976,9 +1039,10 @@
         return {
             meta: {
                 category,
-                category_name: `${CATEGORIES[category].label}（${getCategoryStatusLabel(category)}）`,
+                category_name: `${CATEGORIES[category].label}（${getCategoryStatusLabel(category, state.collectionStatus)}）`,
                 export_date: new Date().toISOString(),
                 total_count: data.length,
+                complete: state.status === 'paused_for_download',
                 page_range: state.pageRange || null,
                 page_range_label: formatPageRange(state.pageRange),
                 source: 'Douban Media Export Tool',
@@ -1008,7 +1072,7 @@
         const ws = XLSX.utils.aoa_to_sheet(sheet);
         ws['!cols'] = exportFields.map(field => ({ wch: field === 'title' ? 42 : field === 'comment' || field === 'intro' ? 52 : field === 'link' ? 64 : field === 'cover_file' ? 36 : 16 }));
         const wb = XLSX.utils.book_new();
-        XLSX.utils.book_append_sheet(wb, ws, `${CATEGORIES[category].sheet}（${getCategoryStatusLabel(category)}）`);
+        XLSX.utils.book_append_sheet(wb, ws, `${CATEGORIES[category].sheet}（${getCategoryStatusLabel(category, getState().collectionStatus)}）`);
         return wb;
     }
 
@@ -1065,9 +1129,9 @@
         }
         renderFloatingButton(context);
         const state = getState();
-        if (state.status === 'paused_for_download' && state.category === context) {
+        if (['paused_for_download', 'error'].includes(state.status) && isTaskPage(state, context)) {
             showDownloadPanel(context);
-        } else if (state.status === 'running' && state.category === context) {
+        } else if (state.status === 'running' && isTaskPage(state, context)) {
             setTimeout(() => processPage(context, getSelectedFields()), 800);
         } else if (context !== 'generic' && new URL(location.href).searchParams.get('db_export') === '1') {
             setTimeout(showConfigPanel, 500);
